@@ -4,32 +4,47 @@ from pyproj import Transformer
 from lxml import etree
 import pandas as pd
 import numpy as np
+import fiona
+import os
 
 # 入力GeoPackageファイル
-gpkg_file = "us-ma-boston.gpkg"  # 適宜パスを指定
+gpkg_file = r"/media/yukky/Extreme SSD/nuplan/uncompressed_files/maps/us-ma-boston/9.12.1817/map.gpkg"  # rawプレフィックスでパスを指定
+print(f"ファイルは存在しますか？: {os.path.exists(gpkg_file)}")
 
-# GeoPackageから必要レイヤーを読み込む
-lanes_gdf = gpd.read_file(gpkg_file, layer="lanes")
+# 利用可能なレイヤーを表示
+print("利用可能なレイヤー:")
+for layer in fiona.listlayers(gpkg_file):
+    print(f"- {layer}")
+
+# GeoPackageから必要レイヤーを読み込む - レイヤー名を実際のものに修正
+lanes_gdf = gpd.read_file(gpkg_file, layer="lanes_polygons")  # 'lanes'から'lanes_polygons'に修正
 connectors_gdf = gpd.read_file(gpkg_file, layer="lane_connectors")
 try:
-    stop_gdf = gpd.read_file(gpkg_file, layer="stop_lines")
-except Exception:
+    stop_gdf = gpd.read_file(gpkg_file, layer="stop_polygons")  # 'stop_lines'から'stop_polygons'に修正
+except Exception as e:
+    print(f"停止線データの読み込みエラー: {e}")
     stop_gdf = None
 try:
     tl_gdf = gpd.read_file(gpkg_file, layer="traffic_lights")
-except Exception:
+except Exception as e:
+    print(f"信号機データの読み込みエラー: {e}")
     tl_gdf = None
 
 # 座標系の確認と変換器の準備
 input_crs = lanes_gdf.crs
 output_crs = "EPSG:4326"
+print(f"入力座標系: {input_crs}")
 if input_crs and input_crs != output_crs:
     transformer = Transformer.from_crs(input_crs, output_crs, always_xy=True)
+    print(f"座標変換を行います: {input_crs} → {output_crs}")
 else:
     transformer = None
+    print("座標変換は不要です")
 
 # レーンおよびレーンコネクタ全てを一つに統合
+print(f"レーン数: {len(lanes_gdf)}, コネクタ数: {len(connectors_gdf)}")
 all_segments = pd.concat([lanes_gdf, connectors_gdf], ignore_index=True)
+print(f"処理対象セグメント数: {len(all_segments)}")
 
 # 抽出した左右境界ラインを保持するリスト
 left_boundaries = []
@@ -53,7 +68,7 @@ for idx, row in all_segments.iterrows():
 
     coords = list(exterior.coords)[:-1]  # 外周座標列（最後の重複点除外）
     n = len(coords)
-    if n < 2:
+    if n < 4:  # 少なくとも4点必要（左右の境界に各2点ずつ）
         continue
 
     # 各エッジの長さを計算
@@ -63,21 +78,48 @@ for idx, row in all_segments.iterrows():
         dx = coords[j][0] - coords[i][0]
         dy = coords[j][1] - coords[i][1]
         lengths.append((dx**2 + dy**2) ** 0.5)
+    
     # 長さが短いエッジを二つ特定
-    if n < 4:
-        short_edges = np.argsort(lengths)[:1]
+    short_edges_indices = np.argsort(lengths)[:min(2, n-2)]  # 最低でもn-2点残す
+    if len(short_edges_indices) < 2:
+        # 短いエッジが1つしか見つからない場合は対向する位置のエッジも選択
+        if len(short_edges_indices) == 1:
+            e1 = short_edges_indices[0]
+            e2 = (e1 + n//2) % n  # 対向する位置のエッジを選択
+        else:
+            continue  # エッジが見つからない場合はスキップ
     else:
-        short_edges = np.argsort(lengths)[:2]
-    e1, e2 = sorted(short_edges.tolist())
+        e1, e2 = sorted(short_edges_indices.tolist())
+    
     # 短辺を除いた左側・右側の座標列を取得
     start1 = (e1 + 1) % n
     end1 = e2
     start2 = (e2 + 1) % n
     end2 = e1
+    
     coords1 = coords[start1:end1+1] if start1 <= end1 else coords[start1:] + coords[:end1+1]
     coords2 = coords[start2:end2+1] if start2 <= end2 else coords[start2:] + coords[:end2+1]
-    left_boundaries.append(LineString(coords1))
-    right_boundaries.append(LineString(coords2))
+    
+    # 座標点が2点以上あることを確認してからLineStringを作成
+    if len(coords1) >= 2:
+        left_boundaries.append(LineString(coords1))
+    else:
+        print(f"警告: インデックス {idx} のセグメントから左側境界線を作成できませんでした（座標点数: {len(coords1)}）")
+        
+    if len(coords2) >= 2:
+        right_boundaries.append(LineString(coords2))
+    else:
+        print(f"警告: インデックス {idx} のセグメントから右側境界線を作成できませんでした（座標点数: {len(coords2)}）")
+
+# 左右境界線の数が一致しているか確認
+if len(left_boundaries) != len(right_boundaries):
+    print(f"警告: 左境界線数 ({len(left_boundaries)}) と右境界線数 ({len(right_boundaries)}) が一致しません")
+    # 少ない方に合わせる
+    min_count = min(len(left_boundaries), len(right_boundaries))
+    left_boundaries = left_boundaries[:min_count]
+    right_boundaries = right_boundaries[:min_count]
+
+print(f"有効な境界線ペア数: {len(left_boundaries)}")
 
 # OSM XMLのルート要素を作成
 osm_root = etree.Element("osm", version="0.6")
